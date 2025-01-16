@@ -3,14 +3,17 @@ use bytes::{BufMut, BytesMut};
 use env_logger::Builder;
 use futures::future::Either;
 use futures::FutureExt;
-use log::{debug, error, info};
+use log::{debug, info};
+use multimap::MultiMap;
 use regex::Regex;
 use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::sleep;
 
 type Token = [u8; 32];
 type Side = [u8; 8];
@@ -42,23 +45,18 @@ impl HandshakeType {
 #[derive(Debug)]
 struct Connection {
     stream: Arc<Mutex<TcpStream>>,
-    handshake: OnceCell<HandshakeType>,
+    handshake: HandshakeType,
 }
 
 impl Connection {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: TcpStream, handshake: HandshakeType) -> Self {
         let stream = Arc::new(Mutex::new(stream));
-        Connection {
-            stream,
-            handshake: OnceCell::new(),
-        }
+        Connection { stream, handshake }
     }
 
-    async fn handle_handshake(&mut self) -> anyhow::Result<HandshakeType> {
+    async fn handle_handshake(mut stream: TcpStream) -> anyhow::Result<Connection> {
         let regex_lagacy = Regex::new(r"^please relay (\w{64})$").unwrap();
         let regex_current = Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap();
-
-        let mut stream = self.stream.lock().await;
 
         let mut buf = BytesMut::with_capacity(128).limit(128);
 
@@ -85,7 +83,8 @@ impl Connection {
                 .try_into()
                 .map_err(|_| anyhow!("Unexpected byte in token"))?;
 
-            Ok(HandshakeType::Legacy { token })
+            let handshake = HandshakeType::Legacy { token };
+            Ok(Self::new(stream, handshake))
         } else if let Some(cap) = regex_current.captures(&line) {
             let token = cap.get(1).ok_or(anyhow!("No token"))?.as_str();
 
@@ -99,7 +98,8 @@ impl Connection {
                 .try_into()
                 .map_err(|_| anyhow!("Unexpected byte in side"))?;
 
-            Ok(HandshakeType::Modern { token, side })
+            let handshake = HandshakeType::Modern { token, side };
+            Ok(Self::new(stream, handshake))
         } else {
             bail!("No valid handshake");
         }
@@ -107,58 +107,76 @@ impl Connection {
 }
 
 #[derive(Debug)]
+struct Pending {
+    peers: RwLock<MultiMap<Token, Arc<Connection>>>,
+}
+
+impl Pending {
+    fn new() -> Self {
+        Pending {
+            peers: RwLock::new(MultiMap::new()),
+        }
+    }
+
+    async fn add(&self, conn: Arc<Connection>) {
+        let mut peers = self.peers.write().await;
+        let token = conn.handshake.get_token();
+        peers.insert(*token, conn);
+    }
+
+    async fn find_match_and_remove(&self, other_peer: Arc<Connection>) -> Option<Arc<Connection>> {
+        let mut peers = self.peers.write().await;
+        let token = other_peer.handshake.get_token();
+        if let Some(peer_list) = peers.remove(token) {
+            for peer in peer_list {
+                let side = peer.handshake.get_side();
+                let other_side = other_peer.handshake.get_side();
+                match (side, other_side) {
+                    (None, _) | (_, None) => return Some(peer),
+                    (Some(s1), Some(s2)) if s1 != s2 => return Some(peer),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    async fn remove(&self, peer: Arc<Connection>) {
+        let mut peers = self.peers.write().await;
+        let token = peer.handshake.get_token();
+        peers.remove(token);
+    }
+}
+
+#[derive(Debug)]
 struct TransitRelay {
-    pending: RwLock<Vec<Arc<Connection>>>,
+    pending: Pending,
 }
 
 impl TransitRelay {
     fn new() -> Self {
         TransitRelay {
-            pending: RwLock::new(Vec::new()),
+            pending: Pending::new(),
         }
     }
 
-    async fn handle_connection(&self, stream: TcpStream) -> anyhow::Result<()> {
-        let mut conn = Connection::new(stream);
-
-        let handshake = conn.handle_handshake().await?;
-        conn.handshake.set(handshake).expect("First init");
-
-        let handshake = conn.handshake.get().expect("Set at connect");
-        let token = handshake.get_token();
-        let side = handshake.get_side();
-
+    async fn handle_connection(&self, conn: Arc<Connection>) -> anyhow::Result<()> {
         debug!("Peer connected: {:?}", conn.handshake);
 
-        if let Some(partner) = self.find_match(token, side).await {
+        if let Some(partner) = self.pending.find_match_and_remove(conn.clone()).await {
             // Partner found - notify them and start relay
-            self.remove_pending(partner.clone()).await?;
-
             info!(
                 "Peers matched: {:?} <-> {:?}",
                 conn.handshake, partner.handshake
             );
 
-            Self::tunnel(conn.stream, partner.stream.clone()).await?;
-
-            // Start relay with partner...
+            Self::tunnel(conn.stream.clone(), partner.stream.clone()).await?;
         } else {
             // No partner yet - add to pending and wait
-            let mut pending = self.pending.write().await;
-            pending.push(Arc::new(conn));
-            debug!("Pending len: {}", pending.len())
+            self.pending.add(conn.clone()).await;
+            sleep(Duration::from_secs(10)).await;
         }
 
-        Ok(())
-    }
-
-    async fn remove_pending(&self, conn: Arc<Connection>) -> anyhow::Result<()> {
-        let mut pending = self.pending.write().await;
-        let i = pending
-            .iter()
-            .position(|c| c.handshake == conn.handshake)
-            .ok_or(anyhow!("Element not found"))?;
-        pending.remove(i);
         Ok(())
     }
 
@@ -218,30 +236,19 @@ impl TransitRelay {
         }
         Ok(())
     }
+}
 
-    async fn find_match(
-        &self,
-        other_token: &Token,
-        other_side: Option<&Side>,
-    ) -> Option<Arc<Connection>> {
-        let pending = self.pending.read().await;
+async fn create_connection(relay: Arc<TransitRelay>, stream: TcpStream) -> anyhow::Result<()> {
+    let conn = Connection::handle_handshake(stream).await?;
+    let conn = Arc::new(conn);
 
-        pending
-            .iter()
-            .filter(|c| {
-                let token = c.handshake.get().expect("Set at connect").get_token();
-                token == other_token
-            })
-            .find(|c| {
-                let side = c.handshake.get().expect("Set at connect").get_side();
-
-                match (other_side, side) {
-                    (None, _) | (_, None) => true,
-                    (Some(s1), Some(s2)) => *s1 != *s2,
-                }
-            })
-            .map(|conn| conn.clone())
+    if let Err(e) = relay.handle_connection(conn.clone()).await {
+        info!("Connection error: {}", e);
     }
+
+    relay.pending.remove(conn).await;
+
+    Ok(())
 }
 
 // main.rs
@@ -256,10 +263,8 @@ async fn main() {
     loop {
         let (stream, _stocket) = listener.accept().await.expect("Failed to listen");
 
-        let relay = relay.clone();
-
-        if let Err(e) = relay.handle_connection(stream).await {
-            error!("Relaying failed: {}", e);
+        if let Err(e) = create_connection(relay.clone(), stream).await {
+            info!("Connection error: {}", e);
         }
     }
 }
