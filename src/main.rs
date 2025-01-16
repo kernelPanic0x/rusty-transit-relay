@@ -7,6 +7,7 @@ use futures::FutureExt;
 use log::{debug, info};
 use multimap::MultiMap;
 use regex::Regex;
+use std::fmt;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
@@ -39,6 +40,24 @@ impl HandshakeType {
         match self {
             HandshakeType::Legacy { .. } => None,
             HandshakeType::Modern { token: _, side } => Some(side),
+        }
+    }
+}
+
+impl fmt::Display for HandshakeType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            HandshakeType::Legacy { token } => {
+                write!(f, "Legacy(token={})", hex::encode(token))
+            }
+            HandshakeType::Modern { token, side } => {
+                write!(
+                    f,
+                    "Modern(token={}, side={})",
+                    hex::encode(token),
+                    hex::encode(side)
+                )
+            }
         }
     }
 }
@@ -163,16 +182,17 @@ impl TransitRelay {
     }
 
     async fn handle_connection(&self, conn: Arc<Connection>) -> anyhow::Result<()> {
-        debug!("Peer connected: {:?}", conn.handshake);
+        debug!("Peer connected: {}", conn.handshake);
 
         if let Some(partner) = self.pending.find_match_and_remove(conn.clone()).await {
             // Partner found - notify them and start relay
             info!(
-                "Peers matched: {:?} <-> {:?}",
+                "Peers matched: {} <-> {}",
                 conn.handshake, partner.handshake
             );
 
             Self::tunnel(conn.stream.clone(), partner.stream.clone()).await?;
+            info!("Tunnel closed")
         } else {
             // No partner yet - add to pending and wait
             self.pending.add(conn.clone()).await;
@@ -191,7 +211,6 @@ impl TransitRelay {
         let mut check_buf = [0u8; 64];
         if let Some(n) = s1.try_read(&mut check_buf).ok() {
             if n > 0 {
-                log::debug!("S1 sent {} bytes before ok flag: {:?}", n, &check_buf[..n]);
                 s1.write_all(b"impatient\n").await?;
                 s2.write_all(b"impatient\n").await?;
                 bail!("Peer impatient");
@@ -199,7 +218,6 @@ impl TransitRelay {
         }
         if let Some(n) = s2.try_read(&mut check_buf).ok() {
             if n > 0 {
-                log::debug!("S2 sent {} bytes before ok flag: {:?}", n, &check_buf[..n]);
                 s1.write_all(b"impatient\n").await?;
                 s2.write_all(b"impatient\n").await?;
                 bail!("Peer impatient");
