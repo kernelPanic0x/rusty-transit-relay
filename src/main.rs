@@ -194,7 +194,7 @@ impl TransitRelay {
                 log::debug!("S1 sent {} bytes before ok flag: {:?}", n, &check_buf[..n]);
                 s1.write_all(b"impatient\n").await?;
                 s2.write_all(b"impatient\n").await?;
-                return Ok(());
+                bail!("Peer impatient");
             }
         }
         if let Some(n) = s2.try_read(&mut check_buf).ok() {
@@ -202,13 +202,13 @@ impl TransitRelay {
                 log::debug!("S2 sent {} bytes before ok flag: {:?}", n, &check_buf[..n]);
                 s1.write_all(b"impatient\n").await?;
                 s2.write_all(b"impatient\n").await?;
-                return Ok(());
+                bail!("Peer impatient");
             }
         }
 
         s1.write_all(b"ok\n").await?;
         s2.write_all(b"ok\n").await?;
-        log::debug!("Ready flags sent, starting relay");
+        debug!("Ready flags sent, starting relay");
 
         let (s1_read, s1_write) = s1.split();
         let (s2_read, s2_write) = s2.split();
