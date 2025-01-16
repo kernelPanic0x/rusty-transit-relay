@@ -1,11 +1,13 @@
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, BytesMut};
+use clap::Parser;
 use env_logger::Builder;
 use futures::future::Either;
 use futures::FutureExt;
 use log::{debug, info};
 use multimap::MultiMap;
 use regex::Regex;
+use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -251,14 +253,42 @@ async fn create_connection(relay: Arc<TransitRelay>, stream: TcpStream) -> anyho
     Ok(())
 }
 
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[clap(long, value_parser = parse_socket_addrs)]
+    listen: Vec<SocketAddr>,
+}
+
+fn parse_socket_addrs(s: &str) -> Result<SocketAddr, std::net::AddrParseError> {
+    s.parse::<SocketAddr>()
+}
+
 // main.rs
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
     Builder::from_default_env().init();
-    let listener = TcpListener::bind("127.0.0.1:4001")
-        .await
-        .expect("Failed to bind");
+
     let relay = Arc::new(TransitRelay::new());
+
+    let mut handles = Vec::new();
+    for addr in args.listen {
+        let relay_clone = relay.clone();
+        handles.push(tokio::spawn(
+            async move { listen_on(addr, relay_clone).await },
+        ));
+    }
+
+    futures::future::join_all(handles).await;
+}
+
+async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
+    let addr = format!("{}:{}", addr.ip(), addr.port());
+
+    let listener = TcpListener::bind(&addr)
+        .await
+        .expect(&format!("Failed to bind to {}", addr));
 
     loop {
         let (stream, _stocket) = listener.accept().await.expect("Failed to listen");
