@@ -255,6 +255,7 @@ impl TransitRelay {
                 }
             }
         }
+        write.flush().await?;
         Ok(())
     }
 }
