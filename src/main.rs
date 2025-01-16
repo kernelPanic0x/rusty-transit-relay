@@ -176,6 +176,7 @@ impl TransitRelay {
         } else {
             // No partner yet - add to pending and wait
             self.pending.add(conn.clone()).await;
+            debug!("Peer added to list");
             sleep(Duration::from_secs(10)).await;
         }
 
@@ -290,11 +291,16 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
         .await
         .expect(&format!("Failed to bind to {}", addr));
 
+    debug!("Listening on {}", addr);
+
     loop {
         let (stream, _stocket) = listener.accept().await.expect("Failed to listen");
 
-        if let Err(e) = create_connection(relay.clone(), stream).await {
-            info!("Connection error: {}", e);
-        }
+        let relay_clone = relay.clone();
+        tokio::spawn(async move {
+            if let Err(e) = create_connection(relay_clone, stream).await {
+                info!("Connection error: {}", e);
+            }
+        });
     }
 }
