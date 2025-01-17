@@ -9,7 +9,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
@@ -218,6 +218,11 @@ impl TransitRelay {
     async fn tunnel(s1: Arc<Mutex<TcpStream>>, s2: Arc<Mutex<TcpStream>>) -> anyhow::Result<()> {
         let mut s1 = s1.lock().await;
         let mut s2 = s2.lock().await;
+
+        // Wait for sockets to be readable
+        for s in [&mut s1, &mut s2] {
+            s.ready(Interest::READABLE).await?;
+        }
 
         // Check for premature data
         if s1.try_read(&mut [0u8; 1])?.max(s2.try_read(&mut [0u8; 1])?) > 0 {
