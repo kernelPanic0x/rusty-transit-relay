@@ -225,13 +225,21 @@ impl TransitRelay {
         }
 
         // Check for premature data
-        if s1.try_read(&mut [0u8; 1])?.max(s2.try_read(&mut [0u8; 1])?) > 0 {
+        if [&mut s1, &mut s2]
+            .iter()
+            .map(|s| s.try_read(&mut [0u8; 1]))
+            .any(|r| match r {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+                _ => true,
+            })
+        {
             for s in [&mut s1, &mut s2] {
-                let _ = s.write_all(b"impatient\n").await;
+                let _ = s.write_all(b"impatient\n");
             }
-            bail!("Peer impatient");
+            bail!("Peer is impatient");
         }
 
+        // Send ready flag
         for s in [&mut s1, &mut s2] {
             s.write_all(b"ok\n").await?;
         }
