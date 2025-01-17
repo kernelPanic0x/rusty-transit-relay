@@ -196,7 +196,7 @@ impl TransitRelay {
         if let Some(partner) = self.pending.find_match_and_remove(conn.clone()).await {
             // Partner found - notify them and start relay
             info!(
-                "Peers matched: {} {} <-> {} {}",
+                "Peers matched: {} {} <=> {} {}",
                 addr,
                 conn.handshake,
                 partner.handshake,
@@ -220,16 +220,17 @@ impl TransitRelay {
         let mut s2 = s2.lock().await;
 
         // Check for premature data
-        let mut check_buf = [0u8; 1];
-        let (n1, n2) = (s1.try_read(&mut check_buf)?, s2.try_read(&mut check_buf)?);
-        if n1 > 0 || n2 > 0 {
-            let _ = s1.write_all(b"impatient\n").await;
-            let _ = s2.write_all(b"impatient\n").await;
-            bail!("Peer impatient")
+        if s1.try_read(&mut [0u8; 1])?.max(s2.try_read(&mut [0u8; 1])?) > 0 {
+            for s in [&mut s1, &mut s2] {
+                let _ = s.write_all(b"impatient\n").await;
+            }
+            bail!("Peer impatient");
         }
 
-        s1.write_all(b"ok\n").await?;
-        s2.write_all(b"ok\n").await?;
+        for s in [&mut s1, &mut s2] {
+            s.write_all(b"ok\n").await?;
+        }
+
         debug!("Ready flags sent, starting relay");
 
         tokio::io::copy_bidirectional_with_sizes(&mut *s1, &mut *s2, BUFFER_SIZE, BUFFER_SIZE)
@@ -280,9 +281,7 @@ async fn main() {
     let mut handles = Vec::new();
     for addr in args.listen {
         let relay_clone = relay.clone();
-        handles.push(tokio::spawn(
-            async move { listen_on(addr, relay_clone).await },
-        ));
+        handles.push(tokio::spawn(listen_on(addr, relay_clone)));
     }
 
     futures::future::join_all(handles).await;
