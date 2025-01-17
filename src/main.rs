@@ -64,16 +64,24 @@ impl fmt::Display for HandshakeType {
 #[derive(Debug)]
 struct Connection {
     stream: Arc<Mutex<TcpStream>>,
+    socket: SocketAddr,
     handshake: HandshakeType,
 }
 
 impl Connection {
-    fn new(stream: TcpStream, handshake: HandshakeType) -> Self {
+    fn new(stream: TcpStream, socket: SocketAddr, handshake: HandshakeType) -> Self {
         let stream = Arc::new(Mutex::new(stream));
-        Connection { stream, handshake }
+        Connection {
+            stream,
+            socket,
+            handshake,
+        }
     }
 
-    async fn handle_handshake(mut stream: TcpStream) -> anyhow::Result<Connection> {
+    async fn handle_handshake(
+        mut stream: TcpStream,
+        socket: SocketAddr,
+    ) -> anyhow::Result<Connection> {
         let regex_lagacy = Regex::new(r"^please relay (\w{64})$").unwrap();
         let regex_current = Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap();
 
@@ -103,7 +111,7 @@ impl Connection {
                 .map_err(|_| anyhow!("Unexpected byte in token"))?;
 
             let handshake = HandshakeType::Legacy { token };
-            Ok(Self::new(stream, handshake))
+            Ok(Self::new(stream, socket, handshake))
         } else if let Some(cap) = regex_current.captures(&line) {
             let token = cap.get(1).ok_or(anyhow!("No token"))?.as_str();
 
@@ -118,7 +126,7 @@ impl Connection {
                 .map_err(|_| anyhow!("Unexpected byte in side"))?;
 
             let handshake = HandshakeType::Modern { token, side };
-            Ok(Self::new(stream, handshake))
+            Ok(Self::new(stream, socket, handshake))
         } else {
             bail!("No valid handshake");
         }
@@ -185,13 +193,17 @@ impl TransitRelay {
     }
 
     async fn handle_connection(&self, conn: Arc<Connection>) -> anyhow::Result<()> {
-        debug!("Peer connected: {}", conn.handshake);
+        let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
+        debug!("Peer connected: {}", &addr);
 
         if let Some(partner) = self.pending.find_match_and_remove(conn.clone()).await {
             // Partner found - notify them and start relay
             info!(
-                "Peers matched: {} <-> {}",
-                conn.handshake, partner.handshake
+                "Peers matched: {} {} <-> {} {}",
+                addr,
+                conn.handshake,
+                partner.handshake,
+                format!("{}:{}", partner.socket.ip(), partner.socket.port())
             );
 
             Self::tunnel(conn.stream.clone(), partner.stream.clone()).await?;
@@ -199,7 +211,7 @@ impl TransitRelay {
         } else {
             // No partner yet - add to pending and wait
             self.pending.add(conn.clone()).await;
-            debug!("Peer added to list");
+            debug!("Peer {} added to list", addr);
             sleep(Duration::from_secs(10)).await;
         }
 
@@ -238,17 +250,23 @@ impl TransitRelay {
     }
 }
 
-async fn create_connection(relay: Arc<TransitRelay>, stream: TcpStream) -> anyhow::Result<()> {
-    let conn = Connection::handle_handshake(stream).await?;
+async fn create_connection(
+    relay: Arc<TransitRelay>,
+    stream: TcpStream,
+    socket: SocketAddr,
+) -> anyhow::Result<()> {
+    let conn = Connection::handle_handshake(stream, socket).await?;
     let conn = Arc::new(conn);
 
+    let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
+
     if let Err(e) = relay.handle_connection(conn.clone()).await {
-        info!("Connection error: {}", e);
+        info!("Connection error: {} ({})", e, &addr,);
     }
 
     relay.pending.remove(conn).await;
-    debug!("Peer removed from list");
-    debug!("Peers in pending list: {}", relay.pending.get_len().await);
+    let num_peers = relay.pending.get_len().await;
+    debug!("Peer {} removed from list ({} peers left)", addr, num_peers);
 
     Ok(())
 }
@@ -290,17 +308,21 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
         .await
         .expect(&format!("Failed to bind to {}", addr));
 
-    debug!("Listening on {}", addr);
+    info!("Listening on {}", addr);
 
     loop {
-        let (stream, _stocket) = listener.accept().await.expect("Failed to listen");
+        let (stream, socket) = listener.accept().await.expect("Failed to listen");
         stream.set_nodelay(true).unwrap();
 
         let relay_clone = relay.clone();
         tokio::spawn(async move {
-            if let Err(e) = create_connection(relay_clone, stream).await {
-                info!("Connection error: {}", e);
+            let addr = format!("{}:{}", socket.ip(), socket.port());
+
+            if let Err(e) = create_connection(relay_clone, stream, socket).await {
+                info!("Connection error ({}): {}", &addr, e);
             }
+
+            info!("Connection closed ({})", addr);
         });
     }
 }
