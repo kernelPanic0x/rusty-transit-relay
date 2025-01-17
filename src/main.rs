@@ -227,14 +227,11 @@ impl TransitRelay {
         // Check for premature data
         if [&mut s1, &mut s2]
             .iter()
-            .map(|s| s.try_read(&mut [0u8; 1]))
-            .any(|r| match r {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                _ => true,
-            })
+            .map(|s| s.try_read(&mut [0u8; 1]).ok())
+            .any(|r| r.unwrap_or_default() > 0)
         {
             for s in [&mut s1, &mut s2] {
-                let _ = s.write_all(b"impatient\n");
+                let _ = s.write_all(b"impatient\n").await;
             }
             bail!("Peer is impatient");
         }
