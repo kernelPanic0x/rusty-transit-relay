@@ -103,7 +103,7 @@ impl Connection {
             }
         };
 
-        if let Some(cap) = regex_lagacy.captures(&line) {
+        if let Some(cap) = regex_lagacy.captures(line) {
             let token = cap.get(1).ok_or(anyhow!("No lagacy token"))?.as_str();
 
             let token = hex::decode(token)?
@@ -112,7 +112,7 @@ impl Connection {
 
             let handshake = HandshakeType::Legacy { token };
             Ok(Self::new(stream, socket, handshake))
-        } else if let Some(cap) = regex_current.captures(&line) {
+        } else if let Some(cap) = regex_current.captures(line) {
             let token = cap.get(1).ok_or(anyhow!("No token"))?.as_str();
 
             let token = hex::decode(token)?
@@ -151,17 +151,11 @@ impl Pending {
         peers.insert(*token, conn);
     }
 
-    // async fn get_len(&self) -> usize {
-    //     let peers = self.peers.read().await;
-    //     peers.len()
-    // }
-
     async fn find_match_and_remove(&self, other_peer: Arc<Connection>) -> Option<Arc<Connection>> {
         let mut peers = self.peers.write().await;
         let token = other_peer.handshake.get_token();
         if let Some(peer_list) = peers.remove(token) {
-            debug!("Peers removed: {:?}", peer_list);
-            debug!("Peers remaining: {}", peers.len());
+            debug!("Peers removed: {:?} ({} remaining)", peer_list, peers.len());
             for peer in peer_list {
                 let side = peer.handshake.get_side();
                 let other_side = other_peer.handshake.get_side();
@@ -179,8 +173,7 @@ impl Pending {
         let mut peers = self.peers.write().await;
         let token = peer.handshake.get_token();
         let removed = peers.remove(token);
-        debug!("Peers removed: {:?}", removed);
-        debug!("Peers remaining: {}", peers.len());
+        debug!("Peers removed: {:?} ({} remaining)", removed, peers.len());
     }
 }
 
@@ -228,19 +221,11 @@ impl TransitRelay {
 
         // Check for premature data
         let mut check_buf = [0u8; 1];
-        if let Some(n) = s1.try_read(&mut check_buf).ok() {
-            if n > 0 {
-                s1.write_all(b"impatient\n").await?;
-                s2.write_all(b"impatient\n").await?;
-                bail!("Peer impatient");
-            }
-        }
-        if let Some(n) = s2.try_read(&mut check_buf).ok() {
-            if n > 0 {
-                s1.write_all(b"impatient\n").await?;
-                s2.write_all(b"impatient\n").await?;
-                bail!("Peer impatient");
-            }
+        let (n1, n2) = (s1.try_read(&mut check_buf)?, s2.try_read(&mut check_buf)?);
+        if n1 > 0 || n2 > 0 {
+            let _ = s1.write_all(b"impatient\n").await;
+            let _ = s2.write_all(b"impatient\n").await;
+            bail!("Peer impatient")
         }
 
         s1.write_all(b"ok\n").await?;
@@ -265,7 +250,7 @@ async fn create_connection(
     let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
 
     if let Err(e) = relay.handle_connection(conn.clone()).await {
-        info!("Connection error: {} ({})", e, &addr,);
+        info!("Connection error: {} ({})", e, &addr);
     }
 
     relay.pending.remove(conn).await;
@@ -276,7 +261,7 @@ async fn create_connection(
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[clap(long, value_parser = parse_socket_addrs)]
+    #[clap(long, value_parser = parse_socket_addrs, default_values = ["0.0.0.0:4001", "[::]:4001"])]
     listen: Vec<SocketAddr>,
 }
 
@@ -308,7 +293,7 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
 
     let listener = TcpListener::bind(&addr)
         .await
-        .expect(&format!("Failed to bind to {}", addr));
+        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
 
     info!("Listening on {}", addr);
 
