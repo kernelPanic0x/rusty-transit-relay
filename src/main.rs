@@ -151,15 +151,17 @@ impl Pending {
         peers.insert(*token, conn);
     }
 
-    async fn get_len(&self) -> usize {
-        let peers = self.peers.read().await;
-        peers.len()
-    }
+    // async fn get_len(&self) -> usize {
+    //     let peers = self.peers.read().await;
+    //     peers.len()
+    // }
 
     async fn find_match_and_remove(&self, other_peer: Arc<Connection>) -> Option<Arc<Connection>> {
         let mut peers = self.peers.write().await;
         let token = other_peer.handshake.get_token();
         if let Some(peer_list) = peers.remove(token) {
+            debug!("Peers removed: {:?}", peer_list);
+            debug!("Peers remaining: {}", peers.len());
             for peer in peer_list {
                 let side = peer.handshake.get_side();
                 let other_side = other_peer.handshake.get_side();
@@ -176,7 +178,9 @@ impl Pending {
     async fn remove(&self, peer: Arc<Connection>) {
         let mut peers = self.peers.write().await;
         let token = peer.handshake.get_token();
-        peers.remove(token);
+        let removed = peers.remove(token);
+        debug!("Peers removed: {:?}", removed);
+        debug!("Peers remaining: {}", peers.len());
     }
 }
 
@@ -265,8 +269,6 @@ async fn create_connection(
     }
 
     relay.pending.remove(conn).await;
-    let num_peers = relay.pending.get_len().await;
-    debug!("Peer {} removed from list ({} peers left)", addr, num_peers);
 
     Ok(())
 }
@@ -317,12 +319,9 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
         let relay_clone = relay.clone();
         tokio::spawn(async move {
             let addr = format!("{}:{}", socket.ip(), socket.port());
-
             if let Err(e) = create_connection(relay_clone, stream, socket).await {
                 info!("Connection error ({}): {}", &addr, e);
             }
-
-            info!("Connection closed ({})", addr);
         });
     }
 }
