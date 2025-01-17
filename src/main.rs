@@ -2,21 +2,19 @@ use anyhow::{anyhow, bail};
 use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use env_logger::Builder;
-use futures::future::Either;
-use futures::FutureExt;
 use log::{debug, info};
 use multimap::MultiMap;
 use regex::Regex;
 use std::fmt;
 use std::net::SocketAddr;
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
+
+const BUFFER_SIZE: usize = 1024 * 1024;
 
 type Token = [u8; 32];
 type Side = [u8; 8];
@@ -145,6 +143,11 @@ impl Pending {
         peers.insert(*token, conn);
     }
 
+    async fn get_len(&self) -> usize {
+        let peers = self.peers.read().await;
+        peers.len()
+    }
+
     async fn find_match_and_remove(&self, other_peer: Arc<Connection>) -> Option<Arc<Connection>> {
         let mut peers = self.peers.write().await;
         let token = other_peer.handshake.get_token();
@@ -208,7 +211,7 @@ impl TransitRelay {
         let mut s2 = s2.lock().await;
 
         // Check for premature data
-        let mut check_buf = [0u8; 64];
+        let mut check_buf = [0u8; 1];
         if let Some(n) = s1.try_read(&mut check_buf).ok() {
             if n > 0 {
                 s1.write_all(b"impatient\n").await?;
@@ -228,34 +231,9 @@ impl TransitRelay {
         s2.write_all(b"ok\n").await?;
         debug!("Ready flags sent, starting relay");
 
-        let (s1_read, s1_write) = s1.split();
-        let (s2_read, s2_write) = s2.split();
+        tokio::io::copy_bidirectional_with_sizes(&mut *s1, &mut *s2, BUFFER_SIZE, BUFFER_SIZE)
+            .await?;
 
-        let fut1 = pin!(Self::transfer(s1_read, s2_write).fuse());
-        let fur2 = pin!(Self::transfer(s2_read, s1_write).fuse());
-
-        match futures::future::select(fut1, fur2).await {
-            Either::Left((Err(e), _)) | Either::Right((Err(e), _)) => Err(e),
-            _ => Ok(()),
-        }
-    }
-
-    async fn transfer(mut read: ReadHalf<'_>, mut write: WriteHalf<'_>) -> anyhow::Result<()> {
-        let mut buf = [0u8; 8192];
-        loop {
-            match read.read(&mut buf).await {
-                Ok(0) => {
-                    break;
-                }
-                Ok(n) => {
-                    write.write_all(&buf[..n]).await?;
-                }
-                Err(e) => {
-                    Err(e)?;
-                }
-            }
-        }
-        write.flush().await?;
         Ok(())
     }
 }
@@ -269,6 +247,8 @@ async fn create_connection(relay: Arc<TransitRelay>, stream: TcpStream) -> anyho
     }
 
     relay.pending.remove(conn).await;
+    debug!("Peer removed from list");
+    debug!("Peers in pending list: {}", relay.pending.get_len().await);
 
     Ok(())
 }
@@ -314,6 +294,7 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
 
     loop {
         let (stream, _stocket) = listener.accept().await.expect("Failed to listen");
+        stream.set_nodelay(true).unwrap();
 
         let relay_clone = relay.clone();
         tokio::spawn(async move {
