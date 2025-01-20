@@ -8,13 +8,15 @@ use regex::Regex;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
+const PEER_TIMEOUT: Duration = Duration::from_secs(5);
+const GC_INTERVAL: Duration = Duration::from_secs(10);
 
 type Token = [u8; 32];
 type Side = [u8; 8];
@@ -63,18 +65,20 @@ impl fmt::Display for HandshakeType {
 // Main struct representing a connection
 #[derive(Debug)]
 struct Connection {
-    stream: Arc<Mutex<TcpStream>>,
+    stream: TcpStream,
     socket: SocketAddr,
     handshake: HandshakeType,
+    timestamp: SystemTime,
 }
 
 impl Connection {
     fn new(stream: TcpStream, socket: SocketAddr, handshake: HandshakeType) -> Self {
-        let stream = Arc::new(Mutex::new(stream));
+        let timestamp = SystemTime::now();
         Connection {
             stream,
             socket,
             handshake,
+            timestamp,
         }
     }
 
@@ -135,45 +139,67 @@ impl Connection {
 
 #[derive(Debug)]
 struct Pending {
-    peers: RwLock<MultiMap<Token, Arc<Connection>>>,
+    peers: Mutex<MultiMap<Token, Connection>>,
 }
 
 impl Pending {
     fn new() -> Self {
         Pending {
-            peers: RwLock::new(MultiMap::new()),
+            peers: Mutex::new(MultiMap::new()),
         }
     }
 
-    async fn add(&self, conn: Arc<Connection>) {
-        let mut peers = self.peers.write().await;
+    async fn add(&self, conn: Connection) {
+        let mut peers = self.peers.lock().await;
         let token = conn.handshake.get_token();
         peers.insert(*token, conn);
     }
 
-    async fn find_match_and_remove(&self, other_peer: Arc<Connection>) -> Option<Arc<Connection>> {
-        let mut peers = self.peers.write().await;
-        let token = other_peer.handshake.get_token();
+    async fn find_match_and_remove(&self, peer: &Connection) -> Option<Connection> {
+        let mut peers = self.peers.lock().await;
+        let token = peer.handshake.get_token();
+
         if let Some(peer_list) = peers.remove(token) {
             debug!("Peers removed: {:?} ({} remaining)", peer_list, peers.len());
-            for peer in peer_list {
+
+            for other_peer in peer_list {
                 let side = peer.handshake.get_side();
                 let other_side = other_peer.handshake.get_side();
+
                 match (side, other_side) {
-                    (None, _) | (_, None) => return Some(peer),
-                    (Some(s1), Some(s2)) if s1 != s2 => return Some(peer),
+                    (None, _) | (_, None) => return Some(other_peer),
+                    (Some(s1), Some(s2)) if s1 != s2 => return Some(other_peer),
                     _ => {}
                 }
             }
         }
+
         None
     }
 
-    async fn remove(&self, peer: Arc<Connection>) {
-        let mut peers = self.peers.write().await;
-        let token = peer.handshake.get_token();
-        let removed = peers.remove(token);
-        debug!("Peers removed: {:?} ({} remaining)", removed, peers.len());
+    async fn collect_garbage(&self) {
+        let mut peers = self.peers.lock().await;
+
+        let now = SystemTime::now();
+
+        let dead = peers
+            .iter()
+            .filter(|(_, conn)| {
+                now.duration_since(conn.timestamp).expect("Timestamp early") > PEER_TIMEOUT
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+
+        let n = dead.len();
+        if n > 0 {
+            debug!("{} dead peers found", n);
+        }
+
+        for peer_key in dead {
+            if let Some(c) = peers.remove(&peer_key) {
+                debug!("Peers removed: {:?} ({} remaining)", c, peers.len());
+            }
+        }
     }
 }
 
@@ -189,36 +215,32 @@ impl TransitRelay {
         }
     }
 
-    async fn handle_connection(&self, conn: Arc<Connection>) -> anyhow::Result<()> {
+    async fn handle_connection(&self, conn: Connection) -> anyhow::Result<()> {
         let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
         debug!("Peer connected: {}", &addr);
 
-        if let Some(partner) = self.pending.find_match_and_remove(conn.clone()).await {
+        if let Some(other_peer) = self.pending.find_match_and_remove(&conn).await {
             // Partner found - notify them and start relay
             info!(
                 "Peers matched: {} {} <=> {} {}",
                 addr,
-                conn.handshake,
-                partner.handshake,
-                format!("{}:{}", partner.socket.ip(), partner.socket.port())
+                &conn.handshake,
+                &other_peer.handshake,
+                format!("{}:{}", other_peer.socket.ip(), other_peer.socket.port())
             );
 
-            Self::tunnel(conn.stream.clone(), partner.stream.clone()).await?;
+            Self::tunnel(conn.stream, other_peer.stream).await?;
             info!("Tunnel closed")
         } else {
             // No partner yet - add to pending and wait
-            self.pending.add(conn.clone()).await;
+            self.pending.add(conn).await;
             debug!("Peer {} added to list", addr);
-            sleep(Duration::from_secs(10)).await;
         }
 
         Ok(())
     }
 
-    async fn tunnel(s1: Arc<Mutex<TcpStream>>, s2: Arc<Mutex<TcpStream>>) -> anyhow::Result<()> {
-        let mut s1 = s1.lock().await;
-        let mut s2 = s2.lock().await;
-
+    async fn tunnel(mut s1: TcpStream, mut s2: TcpStream) -> anyhow::Result<()> {
         // Check for premature data
         if [&mut s1, &mut s2]
             .iter()
@@ -238,7 +260,7 @@ impl TransitRelay {
 
         debug!("Ready flags sent, starting relay");
 
-        tokio::io::copy_bidirectional_with_sizes(&mut *s1, &mut *s2, BUFFER_SIZE, BUFFER_SIZE)
+        tokio::io::copy_bidirectional_with_sizes(&mut s1, &mut s2, BUFFER_SIZE, BUFFER_SIZE)
             .await?;
 
         Ok(())
@@ -251,15 +273,12 @@ async fn create_connection(
     socket: SocketAddr,
 ) -> anyhow::Result<()> {
     let conn = Connection::handle_handshake(stream, socket).await?;
-    let conn = Arc::new(conn);
 
     let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
 
-    if let Err(e) = relay.handle_connection(conn.clone()).await {
+    if let Err(e) = relay.handle_connection(conn).await {
         info!("Connection error: {} ({})", e, &addr);
     }
-
-    relay.pending.remove(conn).await;
 
     Ok(())
 }
@@ -289,12 +308,28 @@ async fn main() {
         handles.push(tokio::spawn(listen_on(addr, relay_clone)));
     }
 
-    futures::future::join_all(handles).await;
+    // Garbage collection job
+    handles.push(tokio::spawn(async move {
+        loop {
+            relay.pending.collect_garbage().await;
+            sleep(GC_INTERVAL).await;
+        }
+    }));
+
+    let _ = futures::future::select_all(handles).await;
+    unreachable!("Critical process exited")
+}
+
+fn format_ip_port(addr: &SocketAddr) -> String {
+    if addr.is_ipv6() {
+        format!("[{}]:{}", addr.ip(), addr.port())
+    } else {
+        format!("{}:{}", addr.ip(), addr.port())
+    }
 }
 
 async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
-    let addr = format!("{}:{}", addr.ip(), addr.port());
-
+    let addr = format_ip_port(&addr);
     let listener = TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
@@ -303,11 +338,11 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
 
     loop {
         let (stream, socket) = listener.accept().await.expect("Failed to listen");
-        stream.set_nodelay(true).unwrap();
+        stream.set_nodelay(true).expect("Set socket no delay");
 
         let relay_clone = relay.clone();
         tokio::spawn(async move {
-            let addr = format!("{}:{}", socket.ip(), socket.port());
+            let addr = format_ip_port(&socket);
             if let Err(e) = create_connection(relay_clone, stream, socket).await {
                 info!("Connection error ({}): {}", &addr, e);
             }
