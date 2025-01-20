@@ -216,7 +216,7 @@ impl TransitRelay {
     }
 
     async fn handle_connection(&self, conn: Connection) -> anyhow::Result<()> {
-        let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
+        let addr = format_ip_port(&conn.socket);
         debug!("Peer connected: {}", &addr);
 
         if let Some(other_peer) = self.pending.find_match_and_remove(&conn).await {
@@ -226,7 +226,7 @@ impl TransitRelay {
                 addr,
                 &conn.handshake,
                 &other_peer.handshake,
-                format!("{}:{}", other_peer.socket.ip(), other_peer.socket.port())
+                format_ip_port(&other_peer.socket)
             );
 
             Self::tunnel(conn.stream, other_peer.stream).await?;
@@ -274,7 +274,7 @@ async fn create_connection(
 ) -> anyhow::Result<()> {
     let conn = Connection::handle_handshake(stream, socket).await?;
 
-    let addr = format!("{}:{}", conn.socket.ip(), conn.socket.port());
+    let addr = format_ip_port(&conn.socket);
 
     if let Err(e) = relay.handle_connection(conn).await {
         info!("Connection error: {} ({})", e, &addr);
