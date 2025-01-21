@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail};
-use bytes::{BufMut, BytesMut};
 use clap::Parser;
 use env_logger::Builder;
 use log::{debug, info};
@@ -9,10 +8,10 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,23 +88,23 @@ impl Connection {
         let regex_lagacy = Regex::new(r"^please relay (\w{64})$").unwrap();
         let regex_current = Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap();
 
-        let mut buf = BytesMut::with_capacity(128).limit(128);
+        let mut buf = [0u8; 128];
+        let mut read_buf = ReadBuf::new(&mut buf);
 
-        let line = loop {
-            if buf.remaining_mut() == 0 {
-                bail!("Buffer is full without finding EOL");
+        let line = timeout(PEER_TIMEOUT, async {
+            loop {
+                if read_buf.remaining() == 0 {
+                    bail!("Buffer full");
+                }
+
+                stream.read_buf(&mut read_buf).await?;
+
+                if let Some(pos) = read_buf.filled().iter().position(|&b| b == b'\n') {
+                    return Ok(std::str::from_utf8(&read_buf.filled()[..pos])?);
+                }
             }
-
-            stream.read_buf(&mut buf).await?;
-
-            if let Some(pos) = buf.get_ref().iter().position(|b| b == &b'\n') {
-                let limited = buf
-                    .get_ref()
-                    .get(..pos)
-                    .ok_or(anyhow!("Buffer out of bounds"))?;
-                break std::str::from_utf8(limited)?;
-            }
-        };
+        })
+        .await??;
 
         if let Some(cap) = regex_lagacy.captures(line) {
             let token = cap.get(1).ok_or(anyhow!("No lagacy token"))?.as_str();
