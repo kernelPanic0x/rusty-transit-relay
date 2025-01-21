@@ -274,13 +274,7 @@ async fn create_connection(
     socket: SocketAddr,
 ) -> anyhow::Result<()> {
     let conn = Connection::handle_handshake(stream, socket).await?;
-
-    let addr = format_ip_port(&conn.socket);
-
-    if let Err(e) = relay.handle_connection(conn).await {
-        info!("Connection error: {} ({})", e, &addr);
-    }
-
+    relay.handle_connection(conn).await?;
     Ok(())
 }
 
