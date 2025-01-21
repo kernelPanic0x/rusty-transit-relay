@@ -6,12 +6,17 @@ use multimap::MultiMap;
 use regex::Regex;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
+
+const REGEX_LAGACY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^please relay (\w{64})$").unwrap());
+const REGEX_MODERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap());
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,9 +90,6 @@ impl Connection {
         mut stream: TcpStream,
         socket: SocketAddr,
     ) -> anyhow::Result<Connection> {
-        let regex_lagacy = Regex::new(r"^please relay (\w{64})$").unwrap();
-        let regex_current = Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap();
-
         let mut buf = [0u8; 128];
         let mut read_buf = ReadBuf::new(&mut buf);
 
@@ -106,7 +108,7 @@ impl Connection {
         })
         .await??;
 
-        if let Some(cap) = regex_lagacy.captures(line) {
+        if let Some(cap) = REGEX_LAGACY.captures(line) {
             let token = cap.get(1).ok_or(anyhow!("No lagacy token"))?.as_str();
 
             let token = hex::decode(token)?
@@ -115,7 +117,7 @@ impl Connection {
 
             let handshake = HandshakeType::Legacy { token };
             Ok(Self::new(stream, socket, handshake))
-        } else if let Some(cap) = regex_current.captures(line) {
+        } else if let Some(cap) = REGEX_MODERN.captures(line) {
             let token = cap.get(1).ok_or(anyhow!("No token"))?.as_str();
 
             let token = hex::decode(token)?
