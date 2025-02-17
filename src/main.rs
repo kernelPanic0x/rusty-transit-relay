@@ -217,25 +217,24 @@ impl TransitRelay {
     }
 
     async fn handle_connection(&self, conn: Connection) -> anyhow::Result<()> {
-        let addr = format_ip_port(&conn.socket);
-        debug!("Peer connected: {}", &addr);
+        debug!("Peer connected: {}", &conn.socket);
 
         if let Some(other_peer) = self.pending.find_match_and_remove(&conn).await {
             // Partner found - notify them and start relay
             info!(
                 "Peers matched: {} {} <=> {} {}",
-                addr,
-                &conn.handshake,
-                &other_peer.handshake,
-                format_ip_port(&other_peer.socket)
+                conn.socket,
+                conn.handshake,
+                other_peer.handshake,
+                other_peer.socket
             );
 
             Self::tunnel(conn.stream, other_peer.stream).await?;
             info!("Tunnel closed")
         } else {
             // No partner yet - add to pending and wait
+            debug!("Peer {} added to list", conn.socket);
             self.pending.add(conn).await;
-            debug!("Peer {} added to list", addr);
         }
 
         Ok(())
@@ -315,16 +314,7 @@ async fn main() {
     unreachable!("Critical process exited")
 }
 
-fn format_ip_port(addr: &SocketAddr) -> String {
-    if addr.is_ipv6() {
-        format!("[{}]:{}", addr.ip(), addr.port())
-    } else {
-        format!("{}:{}", addr.ip(), addr.port())
-    }
-}
-
 async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
-    let addr = format_ip_port(&addr);
     let listener = TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
@@ -337,9 +327,8 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
 
         let relay_clone = relay.clone();
         tokio::spawn(async move {
-            let addr = format_ip_port(&socket);
             if let Err(e) = create_connection(relay_clone, stream, socket).await {
-                info!("Connection error ({}): {}", &addr, e);
+                info!("Connection error ({}): {}", socket, e);
             }
         });
     }
