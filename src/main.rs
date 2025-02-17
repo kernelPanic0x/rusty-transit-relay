@@ -52,14 +52,14 @@ impl fmt::Display for HandshakeType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             HandshakeType::Legacy { token } => {
-                write!(f, "Legacy(token={})", hex::encode(token))
+                write!(f, "Legacy(token={})", hex::encode(token.as_ref()))
             }
             HandshakeType::Modern { token, side } => {
                 write!(
                     f,
                     "Modern(token={}, side={})",
-                    hex::encode(token),
-                    hex::encode(side)
+                    hex::encode(token.as_ref()),
+                    hex::encode(side.as_ref())
                 )
             }
         }
@@ -140,7 +140,7 @@ impl Connection {
 
 #[derive(Debug)]
 struct Pending {
-    peers: Mutex<MultiMap<Token, Connection>>,
+    peers: Mutex<MultiMap<Arc<Token>, Connection>>,
 }
 
 impl Pending {
@@ -153,7 +153,7 @@ impl Pending {
     async fn add(&self, conn: Connection) {
         let mut peers = self.peers.lock().await;
         let token = conn.handshake.get_token();
-        peers.insert(*token, conn);
+        peers.insert(Arc::new(*token), conn);
     }
 
     async fn find_match_and_remove(&self, peer: &Connection) -> Option<Connection> {
@@ -188,7 +188,7 @@ impl Pending {
             .filter(|(_, conn)| {
                 now.duration_since(conn.timestamp).expect("Timestamp early") > PEER_TIMEOUT
             })
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 
         let n = dead.len();
