@@ -10,9 +10,6 @@ strip = true      # Removes debug symbols
 debug = false     # Disables debug info
 opt-level = 3     # Maximum optimization level
 
-[profile.release.package."*"]
-codegen-units = 1
-
 [dependencies]
 anyhow = "1.0.95"
 bytes = "1.9.0"
