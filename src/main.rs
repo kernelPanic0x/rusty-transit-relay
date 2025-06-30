@@ -138,22 +138,16 @@ impl Connection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Pending {
-    peers: Mutex<MultiMap<Arc<Token>, Connection>>,
+    peers: Mutex<MultiMap<Token, Connection>>,
 }
 
 impl Pending {
-    fn new() -> Self {
-        Pending {
-            peers: Mutex::new(MultiMap::new()),
-        }
-    }
-
     async fn add(&self, conn: Connection) {
         let mut peers = self.peers.lock().await;
         let token = conn.handshake.get_token();
-        peers.insert(Arc::new(*token), conn);
+        peers.insert(*token, conn);
     }
 
     async fn find_match_and_remove(&self, peer: &Connection) -> Option<Connection> {
@@ -168,7 +162,9 @@ impl Pending {
                 let other_side = other_peer.handshake.get_side();
 
                 match (side, other_side) {
+                    // One peer uses old protocol, connect anyways
                     (None, _) | (_, None) => return Some(other_peer),
+                    // Only return if ID's are not the same
                     (Some(s1), Some(s2)) if s1 != s2 => return Some(other_peer),
                     _ => {}
                 }
@@ -181,19 +177,19 @@ impl Pending {
     async fn collect_garbage(&self) {
         let mut peers = self.peers.lock().await;
 
-        let now = SystemTime::now();
-
         let dead = peers
             .iter()
             .filter(|(_, conn)| {
-                now.duration_since(conn.timestamp).expect("Timestamp early") > PEER_TIMEOUT
+                conn.timestamp
+                    .elapsed()
+                    .unwrap_or(Duration::from_secs(0))
+                    .ge(&PEER_TIMEOUT)
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 
-        let n = dead.len();
-        if n > 0 {
-            debug!("{} dead peers found", n);
+        if dead.len() > 0 {
+            debug!("{} dead peers found", dead.len());
         }
 
         for peer_key in dead {
@@ -212,7 +208,7 @@ struct TransitRelay {
 impl TransitRelay {
     fn new() -> Self {
         TransitRelay {
-            pending: Pending::new(),
+            pending: Pending::default(),
         }
     }
 
@@ -223,10 +219,7 @@ impl TransitRelay {
             // Partner found - notify them and start relay
             info!(
                 "Peers matched: {} {} <=> {} {}",
-                conn.socket,
-                conn.handshake,
-                other_peer.handshake,
-                other_peer.socket
+                conn.socket, conn.handshake, other_peer.handshake, other_peer.socket
             );
 
             Self::tunnel(conn.stream, other_peer.stream).await?;
@@ -280,7 +273,7 @@ async fn create_connection(
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[clap(long, value_parser = parse_socket_addrs, default_values = ["0.0.0.0:4001", "[::]:4001"])]
+    #[clap(long, value_parser = parse_socket_addrs, default_values = ["[::]:4001"])]
     listen: Vec<SocketAddr>,
 }
 
