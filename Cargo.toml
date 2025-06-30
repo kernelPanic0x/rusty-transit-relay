@@ -4,11 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [profile.release]
-lto = "fat"       # More aggressive link-time optimization
-codegen-units = 1 # Maximum optimization
-strip = true      # Removes debug symbols
-debug = false     # Disables debug info
-opt-level = 3     # Maximum optimization level
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
 
 [dependencies]
 anyhow = "1.0.95"
