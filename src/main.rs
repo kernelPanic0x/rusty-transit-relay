@@ -3,8 +3,9 @@ use env_logger::Builder;
 use log::{debug, info};
 use multimap::MultiMap;
 use regex::Regex;
-use std::fmt;
+use std::fmt::{self, Display};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -22,8 +23,57 @@ const BUFFER_SIZE: usize = 1024 * 1024;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const GC_INTERVAL: Duration = Duration::from_secs(10);
 
-type Token = [u8; 32];
-type Side = [u8; 8];
+#[derive(Debug, Error)]
+enum DecodeError {
+    #[error("Hex decode error")]
+    HexDecode(#[from] hex::FromHexError),
+    #[error("Unexpected token variable length")]
+    UnexpectedTokenLength,
+    #[error("Unexpected side variable length")]
+    UnexpectedSideLength,
+}
+
+#[derive(Debug, PartialEq)]
+struct Side(Box<[u8; 8]>);
+
+impl FromStr for Side {
+    type Err = DecodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Side(
+            hex::decode(s)?
+                .try_into()
+                .map_err(|_| DecodeError::UnexpectedSideLength)?,
+        ))
+    }
+}
+
+impl Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(*self.0))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+struct Token(Box<[u8; 32]>);
+
+impl FromStr for Token {
+    type Err = DecodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Token(
+            hex::decode(s)?
+                .try_into()
+                .map_err(|_| DecodeError::UnexpectedTokenLength)?,
+        ))
+    }
+}
+
+impl Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(*self.0))
+    }
+}
 
 // Represents the type of handshake received
 #[derive(Debug, PartialEq)]
@@ -52,15 +102,10 @@ impl fmt::Display for HandshakeType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             HandshakeType::Legacy { token } => {
-                write!(f, "Legacy(token={})", hex::encode(token.as_ref()))
+                write!(f, "Legacy(token={token})")
             }
             HandshakeType::Modern { token, side } => {
-                write!(
-                    f,
-                    "Modern(token={}, side={})",
-                    hex::encode(token.as_ref()),
-                    hex::encode(side.as_ref())
-                )
+                write!(f, "Modern(token={token}, side={side})",)
             }
         }
     }
@@ -91,16 +136,12 @@ enum HandleConnectionError {
     NoToken,
     #[error("Missing side variable")]
     NoSide,
-    #[error("Hex decode error")]
-    HexDecode(#[from] hex::FromHexError),
-    #[error("Unexpected token length")]
-    UnexpectedTokenLength,
-    #[error("Unexpected side length")]
-    UnexpectedSideLength,
     #[error("No valid handshake")]
     NoValidHandshake,
     #[error("Peer is impatient")]
     PeerImpatient,
+    #[error("Decode error")]
+    DecodeError(#[from] DecodeError),
 }
 
 impl Connection {
@@ -142,24 +183,18 @@ impl Connection {
                 .ok_or(HandleConnectionError::NoLagacyToken)?
                 .as_str();
 
-            let token = hex::decode(token)?
-                .try_into()
-                .map_err(|_| HandleConnectionError::UnexpectedTokenLength)?;
+            let token = Token::from_str(token)?;
 
             let handshake = HandshakeType::Legacy { token };
             Ok(Self::new(stream, socket, handshake))
         } else if let Some(cap) = REGEX_MODERN.captures(line) {
             let token = cap.get(1).ok_or(HandleConnectionError::NoToken)?.as_str();
 
-            let token = hex::decode(token)?
-                .try_into()
-                .map_err(|_| HandleConnectionError::UnexpectedTokenLength)?;
+            let token = Token::from_str(token)?;
 
             let side = cap.get(2).ok_or(HandleConnectionError::NoSide)?.as_str();
 
-            let side = hex::decode(side)?
-                .try_into()
-                .map_err(|_| HandleConnectionError::UnexpectedSideLength)?;
+            let side = Side::from_str(side)?;
 
             let handshake = HandshakeType::Modern { token, side };
             Ok(Self::new(stream, socket, handshake))
@@ -178,7 +213,7 @@ impl Pending {
     async fn add(&self, conn: Connection) {
         let mut peers = self.peers.lock().await;
         let token = conn.handshake.get_token();
-        peers.insert(*token, conn);
+        peers.insert(token.clone(), conn);
     }
 
     async fn find_match_and_remove(&self, peer: &Connection) -> Option<Connection> {
@@ -216,7 +251,7 @@ impl Pending {
                     .unwrap_or(Duration::from_secs(0))
                     .ge(&PEER_TIMEOUT)
             })
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 
         if !dead.is_empty() {
