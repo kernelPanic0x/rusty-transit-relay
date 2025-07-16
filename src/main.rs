@@ -77,29 +77,29 @@ struct Connection {
 
 #[derive(Debug, Error)]
 enum HandleConnectionError {
-    #[error("buffer is full")]
+    #[error("Buffer is full")]
     BufferFull,
-    #[error("invalid utf-8 string")]
+    #[error("Invalid utf-8 string")]
     InvalidString(#[from] core::str::Utf8Error),
-    #[error("io error: {0}")]
+    #[error("IO error: {0}")]
     IoError(#[from] tokio::io::Error),
-    #[error("connection timed out")]
+    #[error("Connection timed out")]
     ConnectionTimeout(#[from] tokio::time::error::Elapsed),
-    #[error("missing lagacy token variable")]
+    #[error("Missing lagacy token variable")]
     NoLagacyToken,
-    #[error("missing token variable")]
+    #[error("Missing token variable")]
     NoToken,
-    #[error("missing side variable")]
+    #[error("Missing side variable")]
     NoSide,
-    #[error("hex decode error")]
+    #[error("Hex decode error")]
     HexDecode(#[from] hex::FromHexError),
-    #[error("unexpected token length")]
+    #[error("Unexpected token length")]
     UnexpectedTokenLength,
-    #[error("unexpected side length")]
+    #[error("Unexpected side length")]
     UnexpectedSideLength,
-    #[error("no valid handshake")]
+    #[error("No valid handshake")]
     NoValidHandshake,
-    #[error("peer is impatient")]
+    #[error("Peer is impatient")]
     PeerImpatient,
 }
 
