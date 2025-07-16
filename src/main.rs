@@ -3,7 +3,7 @@ use env_logger::Builder;
 use log::{debug, info};
 use multimap::MultiMap;
 use regex::Regex;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -39,7 +39,7 @@ enum DecodeSideError {
     UnexpectedLength,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 struct Side(Box<[u8; 8]>);
 
 impl FromStr for Side {
@@ -60,7 +60,13 @@ impl Display for Side {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+impl Debug for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
 struct Token(Box<[u8; 32]>);
 
 impl FromStr for Token {
@@ -78,6 +84,12 @@ impl FromStr for Token {
 impl Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", hex::encode(*self.0))
+    }
+}
+
+impl Debug for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
     }
 }
 
