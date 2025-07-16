@@ -24,26 +24,32 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const GC_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
-enum DecodeError {
+enum DecodeTokenError {
     #[error("Hex decode error")]
     HexDecode(#[from] hex::FromHexError),
-    #[error("Unexpected token variable length")]
-    UnexpectedTokenLength,
-    #[error("Unexpected side variable length")]
-    UnexpectedSideLength,
+    #[error("Unexpected length")]
+    UnexpectedLength,
+}
+
+#[derive(Debug, Error)]
+enum DecodeSideError {
+    #[error("Hex decode error")]
+    HexDecode(#[from] hex::FromHexError),
+    #[error("Unexpected length")]
+    UnexpectedLength,
 }
 
 #[derive(Debug, PartialEq)]
 struct Side(Box<[u8; 8]>);
 
 impl FromStr for Side {
-    type Err = DecodeError;
+    type Err = DecodeSideError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Side(
             hex::decode(s)?
                 .try_into()
-                .map_err(|_| DecodeError::UnexpectedSideLength)?,
+                .map_err(|_| DecodeSideError::UnexpectedLength)?,
         ))
     }
 }
@@ -58,13 +64,13 @@ impl Display for Side {
 struct Token(Box<[u8; 32]>);
 
 impl FromStr for Token {
-    type Err = DecodeError;
+    type Err = DecodeTokenError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Token(
             hex::decode(s)?
                 .try_into()
-                .map_err(|_| DecodeError::UnexpectedTokenLength)?,
+                .map_err(|_| DecodeTokenError::UnexpectedLength)?,
         ))
     }
 }
@@ -140,8 +146,10 @@ enum HandleConnectionError {
     NoValidHandshake,
     #[error("Peer is impatient")]
     PeerImpatient,
-    #[error("Decode error")]
-    DecodeError(#[from] DecodeError),
+    #[error("Decode side error")]
+    DecodeSideError(#[from] DecodeSideError),
+    #[error("Decode token error")]
+    DecodeTokenError(#[from] DecodeTokenError),
 }
 
 impl Connection {
