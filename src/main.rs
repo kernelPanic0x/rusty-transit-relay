@@ -1,4 +1,3 @@
-use anyhow::{anyhow, bail};
 use clap::Parser;
 use env_logger::Builder;
 use log::{debug, info};
@@ -8,14 +7,15 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
+use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
-const REGEX_LAGACY: LazyLock<Regex> =
+static REGEX_LAGACY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^please relay (\w{64})$").unwrap());
-const REGEX_MODERN: LazyLock<Regex> =
+static REGEX_MODERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap());
 
 const BUFFER_SIZE: usize = 1024 * 1024;
@@ -75,6 +75,34 @@ struct Connection {
     timestamp: SystemTime,
 }
 
+#[derive(Debug, Error)]
+enum HandleConnectionError {
+    #[error("buffer is full")]
+    BufferFull,
+    #[error("invalid utf-8 string")]
+    InvalidString(#[from] core::str::Utf8Error),
+    #[error("io error: {0}")]
+    IoError(#[from] tokio::io::Error),
+    #[error("connection timed out")]
+    ConnectionTimeout(#[from] tokio::time::error::Elapsed),
+    #[error("missing lagacy token variable")]
+    NoLagacyToken,
+    #[error("missing token variable")]
+    NoToken,
+    #[error("missing side variable")]
+    NoSide,
+    #[error("hex decode error")]
+    HexDecode(#[from] hex::FromHexError),
+    #[error("unexpected token length")]
+    UnexpectedTokenLength,
+    #[error("unexpected side length")]
+    UnexpectedSideLength,
+    #[error("no valid handshake")]
+    NoValidHandshake,
+    #[error("peer is impatient")]
+    PeerImpatient,
+}
+
 impl Connection {
     fn new(stream: TcpStream, socket: SocketAddr, handshake: HandshakeType) -> Self {
         let timestamp = SystemTime::now();
@@ -89,14 +117,14 @@ impl Connection {
     async fn handle_handshake(
         mut stream: TcpStream,
         socket: SocketAddr,
-    ) -> anyhow::Result<Connection> {
+    ) -> Result<Connection, HandleConnectionError> {
         let mut buf = [0u8; 128];
         let mut read_buf = ReadBuf::new(&mut buf);
 
         let line = timeout(PEER_TIMEOUT, async {
             loop {
                 if read_buf.remaining() == 0 {
-                    bail!("Buffer full");
+                    return Err(HandleConnectionError::BufferFull);
                 }
 
                 stream.read_buf(&mut read_buf).await?;
@@ -109,31 +137,34 @@ impl Connection {
         .await??;
 
         if let Some(cap) = REGEX_LAGACY.captures(line) {
-            let token = cap.get(1).ok_or(anyhow!("No lagacy token"))?.as_str();
+            let token = cap
+                .get(1)
+                .ok_or(HandleConnectionError::NoLagacyToken)?
+                .as_str();
 
             let token = hex::decode(token)?
                 .try_into()
-                .map_err(|_| anyhow!("Unexpected byte in token"))?;
+                .map_err(|_| HandleConnectionError::UnexpectedTokenLength)?;
 
             let handshake = HandshakeType::Legacy { token };
             Ok(Self::new(stream, socket, handshake))
         } else if let Some(cap) = REGEX_MODERN.captures(line) {
-            let token = cap.get(1).ok_or(anyhow!("No token"))?.as_str();
+            let token = cap.get(1).ok_or(HandleConnectionError::NoToken)?.as_str();
 
             let token = hex::decode(token)?
                 .try_into()
-                .map_err(|_| anyhow!("Unexpected byte in token"))?;
+                .map_err(|_| HandleConnectionError::UnexpectedTokenLength)?;
 
-            let side = cap.get(2).ok_or(anyhow!("No side"))?.as_str();
+            let side = cap.get(2).ok_or(HandleConnectionError::NoSide)?.as_str();
 
             let side = hex::decode(side)?
                 .try_into()
-                .map_err(|_| anyhow!("Unexpected byte in side"))?;
+                .map_err(|_| HandleConnectionError::UnexpectedSideLength)?;
 
             let handshake = HandshakeType::Modern { token, side };
             Ok(Self::new(stream, socket, handshake))
         } else {
-            bail!("No valid handshake");
+            return Err(HandleConnectionError::NoValidHandshake);
         }
     }
 }
@@ -185,10 +216,10 @@ impl Pending {
                     .unwrap_or(Duration::from_secs(0))
                     .ge(&PEER_TIMEOUT)
             })
-            .map(|(key, _)| key.clone())
+            .map(|(key, _)| *key)
             .collect::<Vec<_>>();
 
-        if dead.len() > 0 {
+        if !dead.is_empty() {
             debug!("{} dead peers found", dead.len());
         }
 
@@ -212,7 +243,7 @@ impl TransitRelay {
         }
     }
 
-    async fn handle_connection(&self, conn: Connection) -> anyhow::Result<()> {
+    async fn handle_connection(&self, conn: Connection) -> Result<(), HandleConnectionError> {
         debug!("Peer connected: {}", &conn.socket);
 
         if let Some(other_peer) = self.pending.find_match_and_remove(&conn).await {
@@ -233,7 +264,7 @@ impl TransitRelay {
         Ok(())
     }
 
-    async fn tunnel(mut s1: TcpStream, mut s2: TcpStream) -> anyhow::Result<()> {
+    async fn tunnel(mut s1: TcpStream, mut s2: TcpStream) -> Result<(), HandleConnectionError> {
         // Check for premature data
         if [&mut s1, &mut s2]
             .iter()
@@ -243,7 +274,7 @@ impl TransitRelay {
             for s in [&mut s1, &mut s2] {
                 let _ = s.write_all(b"impatient\n").await;
             }
-            bail!("Peer is impatient");
+            return Err(HandleConnectionError::PeerImpatient);
         }
 
         // Send ready flag
@@ -283,7 +314,7 @@ fn parse_socket_addrs(s: &str) -> Result<SocketAddr, std::net::AddrParseError> {
 
 // main.rs
 #[tokio::main]
-async fn main() {
+async fn main() -> ! {
     let args = Args::parse();
     Builder::from_default_env().init();
 
@@ -304,24 +335,24 @@ async fn main() {
     }));
 
     let _ = futures::future::select_all(handles).await;
-    unreachable!("Critical process exited")
+    unreachable!("critical process exited")
 }
 
 async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
     let listener = TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
+        .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"));
 
-    info!("Listening on {}", addr);
+    info!("Listening on {addr}");
 
     loop {
-        let (stream, socket) = listener.accept().await.expect("Failed to listen");
-        stream.set_nodelay(true).expect("Set socket no delay");
+        let (stream, socket) = listener.accept().await.expect("failed to listen");
+        stream.set_nodelay(true).expect("set socket no delay");
 
         let relay_clone = relay.clone();
         tokio::spawn(async move {
             if let Err(e) = create_connection(relay_clone, stream, socket).await {
-                info!("Connection error ({}): {}", socket, e);
+                info!("Connection error ({socket}): {e}");
             }
         });
     }
