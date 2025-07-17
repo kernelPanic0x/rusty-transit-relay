@@ -93,7 +93,7 @@ impl Debug for Token {
 }
 
 // Represents the type of handshake received
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 enum HandshakeType {
     Legacy { token: Token },
     Modern { token: Token, side: Side },
@@ -125,6 +125,12 @@ impl fmt::Display for HandshakeType {
                 write!(f, "Modern(token={token}, side={side})",)
             }
         }
+    }
+}
+
+impl Debug for HandshakeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self}")
     }
 }
 
