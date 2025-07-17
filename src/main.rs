@@ -1,11 +1,10 @@
 use clap::Parser;
 use env_logger::Builder;
-use log::{debug, info};
+use log::{debug, info, warn};
 use multimap::MultiMap;
 use regex::Regex;
 use std::fmt::{self, Debug, Display};
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -42,10 +41,10 @@ enum DecodeSideError {
 #[derive(PartialEq)]
 struct Side(Box<[u8; 8]>);
 
-impl FromStr for Side {
-    type Err = DecodeSideError;
+impl TryFrom<&str> for Side {
+    type Error = DecodeSideError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         Ok(Side(
             hex::decode(s)?
                 .try_into()
@@ -69,10 +68,10 @@ impl Debug for Side {
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct Token(Box<[u8; 32]>);
 
-impl FromStr for Token {
-    type Err = DecodeTokenError;
+impl TryFrom<&str> for Token {
+    type Error = DecodeTokenError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         Ok(Token(
             hex::decode(s)?
                 .try_into()
@@ -197,26 +196,29 @@ impl Connection {
         })
         .await??;
 
-        if let Some(cap) = REGEX_LAGACY.captures(line) {
-            let token = cap
+        if let Some(cap) = REGEX_MODERN.captures(line) {
+            let token: Token = cap
                 .get(1)
-                .ok_or(HandleConnectionError::NoLagacyToken)?
-                .as_str();
+                .ok_or(HandleConnectionError::NoToken)?
+                .as_str()
+                .try_into()?;
 
-            let token = Token::from_str(token)?;
-
-            let handshake = HandshakeType::Legacy { token };
-            Ok(Self::new(stream, socket, handshake))
-        } else if let Some(cap) = REGEX_MODERN.captures(line) {
-            let token = cap.get(1).ok_or(HandleConnectionError::NoToken)?.as_str();
-
-            let token = Token::from_str(token)?;
-
-            let side = cap.get(2).ok_or(HandleConnectionError::NoSide)?.as_str();
-
-            let side = Side::from_str(side)?;
+            let side: Side = cap
+                .get(2)
+                .ok_or(HandleConnectionError::NoSide)?
+                .as_str()
+                .try_into()?;
 
             let handshake = HandshakeType::Modern { token, side };
+            Ok(Self::new(stream, socket, handshake))
+        } else if let Some(cap) = REGEX_LAGACY.captures(line) {
+            let token: Token = cap
+                .get(1)
+                .ok_or(HandleConnectionError::NoLagacyToken)?
+                .as_str()
+                .try_into()?;
+
+            let handshake = HandshakeType::Legacy { token };
             Ok(Self::new(stream, socket, handshake))
         } else {
             return Err(HandleConnectionError::NoValidHandshake);
@@ -241,7 +243,11 @@ impl Pending {
         let token = peer.handshake.get_token();
 
         if let Some(peer_list) = peers.remove(token) {
-            debug!("Peers removed: {:?} ({} remaining)", peer_list, peers.len());
+            debug!(
+                "Peers matched and removed from queue: {:?} ({} remaining in queue)",
+                peer_list,
+                peers.len()
+            );
 
             for other_peer in peer_list {
                 let side = peer.handshake.get_side();
@@ -280,26 +286,24 @@ impl Pending {
 
         for peer_key in dead {
             if let Some(c) = peers.remove(&peer_key) {
-                debug!("Peers removed: {:?} ({} remaining)", c, peers.len());
+                debug!(
+                    "Peer removed from queue: {:?} ({} remaining in queue)",
+                    c,
+                    peers.len()
+                );
             }
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TransitRelay {
     pending: Pending,
 }
 
 impl TransitRelay {
-    fn new() -> Self {
-        TransitRelay {
-            pending: Pending::default(),
-        }
-    }
-
     async fn handle_connection(&self, conn: Connection) -> Result<(), HandleConnectionError> {
-        debug!("Peer connected: {}", &conn.socket);
+        info!("Peer connected: {}", &conn.socket);
 
         if let Some(other_peer) = self.pending.find_match_and_remove(&conn).await {
             // Partner found - notify them and start relay
@@ -350,10 +354,9 @@ async fn create_connection(
     relay: Arc<TransitRelay>,
     stream: TcpStream,
     socket: SocketAddr,
-) -> anyhow::Result<()> {
+) -> Result<(), HandleConnectionError> {
     let conn = Connection::handle_handshake(stream, socket).await?;
-    relay.handle_connection(conn).await?;
-    Ok(())
+    relay.handle_connection(conn).await
 }
 
 #[derive(Debug, Parser)]
@@ -373,9 +376,10 @@ async fn main() -> ! {
     let args = Args::parse();
     Builder::from_default_env().init();
 
-    let relay = Arc::new(TransitRelay::new());
+    let relay = Arc::new(TransitRelay::default());
 
     let mut handles = Vec::new();
+
     for addr in args.listen {
         let relay_clone = relay.clone();
         handles.push(tokio::spawn(listen_on(addr, relay_clone)));
@@ -396,13 +400,21 @@ async fn main() -> ! {
 async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
     let listener = TcpListener::bind(&addr)
         .await
-        .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"));
+        .unwrap_or_else(|e| panic!("Failed to bind to {addr}: {e}"));
 
     info!("Listening on {addr}");
 
     loop {
-        let (stream, socket) = listener.accept().await.expect("failed to listen");
-        stream.set_nodelay(true).expect("set socket no delay");
+        let (stream, socket) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to accept connection: {e}");
+                continue;
+            }
+        };
+
+        // Make the connection as realtime as possible
+        stream.set_nodelay(true).expect("Set socket no delay");
 
         let relay_clone = relay.clone();
         tokio::spawn(async move {
