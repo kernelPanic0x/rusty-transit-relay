@@ -3,11 +3,9 @@ use env_logger::Builder;
 use handshake_parser::Token;
 use log::{debug, info, warn};
 use multimap::MultiMap;
-use regex::Regex;
-use std::fmt::{self, Debug, Display};
+use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -15,17 +13,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
-use crate::handshake_parser::{parse_handshake, DecodeSideError, DecodeTokenError, HandshakeType};
+use crate::handshake_parser::{DecodeSideError, DecodeTokenError, HandshakeType, parse_handshake};
 
 mod handshake_parser;
 
-const BUFFER_SIZE: usize = 1024 * 1024;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const GC_INTERVAL: Duration = Duration::from_secs(10);
 
 // Main struct representing a connection
 #[derive(Debug)]
-struct Connection {
+struct Peer {
     stream: TcpStream,
     socket: SocketAddr,
     handshake: HandshakeType,
@@ -42,12 +39,6 @@ enum HandleConnectionError {
     IoError(#[from] tokio::io::Error),
     #[error("Connection timed out")]
     ConnectionTimeout(#[from] tokio::time::error::Elapsed),
-    #[error("Missing lagacy token variable")]
-    NoLagacyToken,
-    #[error("Missing token variable")]
-    NoToken,
-    #[error("Missing side variable")]
-    NoSide,
     #[error("No valid handshake")]
     NoValidHandshake,
     #[error("Peer is impatient")]
@@ -58,10 +49,10 @@ enum HandleConnectionError {
     DecodeTokenError(#[from] DecodeTokenError),
 }
 
-impl Connection {
+impl Peer {
     fn new(stream: TcpStream, socket: SocketAddr, handshake: HandshakeType) -> Self {
         let timestamp = SystemTime::now();
-        Connection {
+        Peer {
             stream,
             socket,
             handshake,
@@ -72,7 +63,7 @@ impl Connection {
     async fn handle_handshake(
         mut stream: TcpStream,
         socket: SocketAddr,
-    ) -> Result<Connection, HandleConnectionError> {
+    ) -> Result<Peer, HandleConnectionError> {
         let mut buf = [0u8; 128];
         let mut read_buf = ReadBuf::new(&mut buf);
 
@@ -100,28 +91,28 @@ impl Connection {
 
 #[derive(Debug, Default)]
 struct Pending {
-    peers: Mutex<MultiMap<Token, Connection>>,
+    peers: Mutex<MultiMap<Token, Peer>>,
 }
 
 impl Pending {
-    async fn add(&self, conn: Connection) {
+    async fn add(&self, peer: Peer) {
         let mut peers = self.peers.lock().await;
-        let token = conn.handshake.get_token();
-        peers.insert(token.clone(), conn);
+        let token = peer.handshake.get_token();
+        peers.insert(token.clone(), peer);
     }
 
-    async fn find_match_and_remove(&self, peer: &Connection) -> Option<Connection> {
+    async fn find_match_and_remove(&self, peer: &Peer) -> Option<Peer> {
         let mut peers = self.peers.lock().await;
         let token = peer.handshake.get_token();
 
-        if let Some(peer_list) = peers.remove(token) {
+        if let Some(peers) = peers.remove(token) {
             debug!(
                 "Peers matched and removed from queue: {:?} ({} remaining in queue)",
-                peer_list,
+                peers,
                 peers.len()
             );
 
-            for other_peer in peer_list {
+            for other_peer in peers {
                 let side = peer.handshake.get_side();
                 let other_side = other_peer.handshake.get_side();
 
@@ -141,10 +132,10 @@ impl Pending {
     async fn collect_garbage(&self) {
         let mut peers = self.peers.lock().await;
 
-        let dead = peers
+        let tokens = peers
             .iter()
-            .filter(|(_, conn)| {
-                conn.timestamp
+            .filter(|(_, peer)| {
+                peer.timestamp
                     .elapsed()
                     .unwrap_or(Duration::from_secs(0))
                     .ge(&PEER_TIMEOUT)
@@ -152,12 +143,12 @@ impl Pending {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
 
-        if !dead.is_empty() {
-            debug!("{} dead peers found", dead.len());
+        if !tokens.is_empty() {
+            debug!("{} dead peers found", tokens.len());
         }
 
-        for peer_key in dead {
-            if let Some(c) = peers.remove(&peer_key) {
+        for token in tokens {
+            if let Some(c) = peers.remove(&token) {
                 debug!(
                     "Peer removed from queue: {:?} ({} remaining in queue)",
                     c,
@@ -174,22 +165,22 @@ struct TransitRelay {
 }
 
 impl TransitRelay {
-    async fn handle_connection(&self, conn: Connection) -> Result<(), HandleConnectionError> {
-        info!("Peer connected: {}", &conn.socket);
+    async fn handle_connection(&self, peer: Peer) -> Result<(), HandleConnectionError> {
+        info!("Peer connected: {}", &peer.socket);
 
-        if let Some(other_peer) = self.pending.find_match_and_remove(&conn).await {
+        if let Some(other_peer) = self.pending.find_match_and_remove(&peer).await {
             // Partner found - notify them and start relay
             info!(
                 "Peers matched: {} {} <=> {} {}",
-                conn.socket, conn.handshake, other_peer.handshake, other_peer.socket
+                peer.socket, peer.handshake, other_peer.handshake, other_peer.socket
             );
 
-            Self::tunnel(conn.stream, other_peer.stream).await?;
+            Self::tunnel(peer.stream, other_peer.stream).await?;
             info!("Tunnel closed")
         } else {
             // No partner yet - add to pending and wait
-            debug!("Peer {} added to list", conn.socket);
-            self.pending.add(conn).await;
+            debug!("Peer {} added to list", peer.socket);
+            self.pending.add(peer).await;
         }
 
         Ok(())
@@ -215,8 +206,7 @@ impl TransitRelay {
 
         debug!("Ready flags sent, starting relay");
 
-        tokio::io::copy_bidirectional_with_sizes(&mut s1, &mut s2, BUFFER_SIZE, BUFFER_SIZE)
-            .await?;
+        tokio::io::copy_bidirectional(&mut s1, &mut s2).await?;
 
         Ok(())
     }
@@ -227,7 +217,7 @@ async fn create_connection(
     stream: TcpStream,
     socket: SocketAddr,
 ) -> Result<(), HandleConnectionError> {
-    let conn = Connection::handle_handshake(stream, socket).await?;
+    let conn = Peer::handle_handshake(stream, socket).await?;
     relay.handle_connection(conn).await
 }
 

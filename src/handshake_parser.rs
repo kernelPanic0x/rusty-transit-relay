@@ -1,14 +1,12 @@
 use std::fmt::{self, Debug, Display};
 use std::str::FromStr;
 
-use clap::error::ErrorFormatter;
 use thiserror::Error;
+use winnow::Result;
 use winnow::ascii::space1;
 use winnow::combinator::{alt, eof};
-use winnow::error::ContextError;
 use winnow::token::literal;
-use winnow::Result;
-use winnow::{ascii::hex_digit0, Parser};
+use winnow::{Parser, ascii::hex_digit0};
 
 #[derive(Debug, Error)]
 pub enum DecodeTokenError {

@@ -554,7 +554,6 @@ dependencies = [
  "hex",
  "log",
  "multimap",
- "regex",
  "rust-fsm",
  "thiserror",
  "tokio",
