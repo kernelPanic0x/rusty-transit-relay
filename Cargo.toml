@@ -22,3 +22,4 @@ regex = "1.11.1"
 rust-fsm = "0.7.0"
 thiserror = "2.0.12"
 tokio = { version = "1.43.0", features = ["full"] }
+winnow = "0.7.12"

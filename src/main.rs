@@ -1,10 +1,12 @@
 use clap::Parser;
 use env_logger::Builder;
+use handshake_parser::Token;
 use log::{debug, info, warn};
 use multimap::MultiMap;
 use regex::Regex;
 use std::fmt::{self, Debug, Display};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -13,126 +15,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
-static REGEX_LAGACY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^please relay (\w{64})$").unwrap());
-static REGEX_MODERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^please relay (\w{64}) for side (\w{16})$").unwrap());
+use crate::handshake_parser::{parse_handshake, DecodeSideError, DecodeTokenError, HandshakeType};
+
+mod handshake_parser;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const GC_INTERVAL: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Error)]
-enum DecodeTokenError {
-    #[error("Hex decode error")]
-    HexDecode(#[from] hex::FromHexError),
-    #[error("Unexpected length")]
-    UnexpectedLength,
-}
-
-#[derive(Debug, Error)]
-enum DecodeSideError {
-    #[error("Hex decode error")]
-    HexDecode(#[from] hex::FromHexError),
-    #[error("Unexpected length")]
-    UnexpectedLength,
-}
-
-#[derive(PartialEq)]
-struct Side(Box<[u8; 8]>);
-
-impl TryFrom<&str> for Side {
-    type Error = DecodeSideError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        Ok(Side(
-            hex::decode(s)?
-                .try_into()
-                .map_err(|_| DecodeSideError::UnexpectedLength)?,
-        ))
-    }
-}
-
-impl Display for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(*self.0))
-    }
-}
-
-impl Debug for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self}")
-    }
-}
-
-#[derive(PartialEq, Eq, Hash, Clone)]
-struct Token(Box<[u8; 32]>);
-
-impl TryFrom<&str> for Token {
-    type Error = DecodeTokenError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        Ok(Token(
-            hex::decode(s)?
-                .try_into()
-                .map_err(|_| DecodeTokenError::UnexpectedLength)?,
-        ))
-    }
-}
-
-impl Display for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(*self.0))
-    }
-}
-
-impl Debug for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self}")
-    }
-}
-
-// Represents the type of handshake received
-#[derive(PartialEq)]
-enum HandshakeType {
-    Legacy { token: Token },
-    Modern { token: Token, side: Side },
-}
-
-impl HandshakeType {
-    fn get_token(&self) -> &Token {
-        match self {
-            HandshakeType::Legacy { token } => token,
-            HandshakeType::Modern { token, .. } => token,
-        }
-    }
-
-    fn get_side(&self) -> Option<&Side> {
-        match self {
-            HandshakeType::Legacy { .. } => None,
-            HandshakeType::Modern { token: _, side } => Some(side),
-        }
-    }
-}
-
-impl fmt::Display for HandshakeType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            HandshakeType::Legacy { token } => {
-                write!(f, "Legacy(token={token})")
-            }
-            HandshakeType::Modern { token, side } => {
-                write!(f, "Modern(token={token}, side={side})",)
-            }
-        }
-    }
-}
-
-impl Debug for HandshakeType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self}")
-    }
-}
 
 // Main struct representing a connection
 #[derive(Debug)]
@@ -187,7 +76,7 @@ impl Connection {
         let mut buf = [0u8; 128];
         let mut read_buf = ReadBuf::new(&mut buf);
 
-        let line = timeout(PEER_TIMEOUT, async {
+        let mut line = timeout(PEER_TIMEOUT, async {
             loop {
                 if read_buf.remaining() == 0 {
                     return Err(HandleConnectionError::BufferFull);
@@ -202,33 +91,10 @@ impl Connection {
         })
         .await??;
 
-        if let Some(cap) = REGEX_MODERN.captures(line) {
-            let token: Token = cap
-                .get(1)
-                .ok_or(HandleConnectionError::NoToken)?
-                .as_str()
-                .try_into()?;
+        let handshake =
+            parse_handshake(&mut line).map_err(|_| HandleConnectionError::NoValidHandshake)?;
 
-            let side: Side = cap
-                .get(2)
-                .ok_or(HandleConnectionError::NoSide)?
-                .as_str()
-                .try_into()?;
-
-            let handshake = HandshakeType::Modern { token, side };
-            Ok(Self::new(stream, socket, handshake))
-        } else if let Some(cap) = REGEX_LAGACY.captures(line) {
-            let token: Token = cap
-                .get(1)
-                .ok_or(HandleConnectionError::NoLagacyToken)?
-                .as_str()
-                .try_into()?;
-
-            let handshake = HandshakeType::Legacy { token };
-            Ok(Self::new(stream, socket, handshake))
-        } else {
-            return Err(HandleConnectionError::NoValidHandshake);
-        }
+        Ok(Self::new(stream, socket, handshake))
     }
 }
 
