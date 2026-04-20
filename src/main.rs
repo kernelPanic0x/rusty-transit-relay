@@ -1,7 +1,7 @@
 use clap::Parser;
 use env_logger::Builder;
 use handshake_parser::Token;
-use log::{debug, info, warn};
+use log::{debug, error, info};
 use multimap::MultiMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
@@ -270,7 +270,7 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
         let (stream, socket) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
-                warn!("Failed to accept connection: {e}");
+                error!("Failed to accept connection: {e}");
                 continue;
             }
         };
@@ -281,7 +281,7 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
         let relay_clone = relay.clone();
         tokio::spawn(async move {
             if let Err(e) = create_connection(relay_clone, stream, socket).await {
-                info!("Connection error ({socket}): {e}");
+                error!("Connection error ({socket}): {e}");
             }
         });
     }
