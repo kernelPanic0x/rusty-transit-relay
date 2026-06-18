@@ -62,7 +62,7 @@ impl Peer {
         mut stream: TcpStream,
         socket: SocketAddr,
     ) -> Result<Peer, HandleConnectionError> {
-        let mut buf = [0u8; 128];
+        let mut buf = Vec::with_capacity(128);
         let mut read_buf = ReadBuf::new(&mut buf);
 
         let mut line = timeout(PEER_TIMEOUT, async {
@@ -99,26 +99,26 @@ impl Pending {
         peers.insert(token.clone(), peer);
     }
 
-    async fn find_match_and_remove(&self, peer: &Peer) -> Option<Peer> {
+    async fn match_peers(&self, peer_a: &Peer) -> Option<Peer> {
         let mut peers = self.peers.lock().await;
-        let token = peer.handshake.get_token();
+        let token_a = peer_a.handshake.get_token();
 
-        if let Some(peers) = peers.remove(token) {
+        if let Some(peers) = peers.remove(token_a) {
             debug!(
                 "Peers matched and removed from queue: {:?} ({} remaining in queue)",
                 peers,
                 peers.len()
             );
 
-            for other_peer in peers {
-                let side = peer.handshake.get_side();
-                let other_side = other_peer.handshake.get_side();
+            for peer_b in peers {
+                let side_a = peer_a.handshake.get_side();
+                let side_b = peer_b.handshake.get_side();
 
-                match (side, other_side) {
+                match (side_a, side_b) {
                     // One peer uses old protocol, connect anyways
-                    (None, _) | (_, None) => return Some(other_peer),
+                    (None, _) | (_, None) => return Some(peer_b),
                     // Only return if ID's are not the same
-                    (Some(s1), Some(s2)) if s1 != s2 => return Some(other_peer),
+                    (Some(s1), Some(s2)) if s1 != s2 => return Some(peer_b),
                     _ => {}
                 }
             }
@@ -135,6 +135,7 @@ impl Pending {
             .filter(|(_, peer)| {
                 peer.timestamp
                     .elapsed()
+                    // In case we are in the future, just use 0
                     .unwrap_or(Duration::from_secs(0))
                     .ge(&PEER_TIMEOUT)
             })
@@ -163,10 +164,19 @@ struct TransitRelay {
 }
 
 impl TransitRelay {
-    async fn handle_connection(&self, peer: Peer) -> Result<(), HandleConnectionError> {
+    async fn handle_connection(
+        &self,
+        stream: TcpStream,
+        socket: SocketAddr,
+    ) -> Result<(), HandleConnectionError> {
+        let peer = Peer::handle_handshake(stream, socket).await?;
+        self.match_peers(peer).await
+    }
+
+    async fn match_peers(&self, peer: Peer) -> Result<(), HandleConnectionError> {
         info!("Peer connected: {}", &peer.socket);
 
-        if let Some(other_peer) = self.pending.find_match_and_remove(&peer).await {
+        if let Some(other_peer) = self.pending.match_peers(&peer).await {
             // Partner found - notify them and start relay
             info!(
                 "Peers matched: {} {} <=> {} {}",
@@ -208,15 +218,6 @@ impl TransitRelay {
 
         Ok(())
     }
-}
-
-async fn create_connection(
-    relay: &'static TransitRelay,
-    stream: TcpStream,
-    socket: SocketAddr,
-) -> Result<(), HandleConnectionError> {
-    let conn = Peer::handle_handshake(stream, socket).await?;
-    relay.handle_connection(conn).await
 }
 
 #[derive(Debug, Parser)]
@@ -276,7 +277,7 @@ async fn listen_on(addr: SocketAddr, relay: &'static TransitRelay) {
         stream.set_nodelay(true).expect("Set socket no delay");
 
         tokio::spawn(async move {
-            if let Err(e) = create_connection(relay, stream, socket).await {
+            if let Err(e) = relay.handle_connection(stream, socket).await {
                 error!("Connection error ({socket}): {e}");
             }
         });
