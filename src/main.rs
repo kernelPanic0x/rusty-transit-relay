@@ -1,11 +1,9 @@
 use clap::Parser;
-use env_logger::Builder;
 use handshake_parser::Token;
 use log::{debug, error, info};
 use multimap::MultiMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -213,7 +211,7 @@ impl TransitRelay {
 }
 
 async fn create_connection(
-    relay: Arc<TransitRelay>,
+    relay: &'static TransitRelay,
     stream: TcpStream,
     socket: SocketAddr,
 ) -> Result<(), HandleConnectionError> {
@@ -236,15 +234,14 @@ fn parse_socket_addrs(s: &str) -> Result<SocketAddr, std::net::AddrParseError> {
 #[tokio::main]
 async fn main() -> ! {
     let args = Args::parse();
-    Builder::from_default_env().init();
+    env_logger::init();
 
-    let relay = Arc::new(TransitRelay::default());
+    let relay: &'static TransitRelay = Box::leak(Box::new(TransitRelay::default()));
 
     let mut handles = Vec::new();
 
     for addr in args.listen {
-        let relay_clone = relay.clone();
-        handles.push(tokio::spawn(listen_on(addr, relay_clone)));
+        handles.push(tokio::spawn(listen_on(addr, relay)));
     }
 
     // Garbage collection job
@@ -259,7 +256,7 @@ async fn main() -> ! {
     unreachable!("critical process exited")
 }
 
-async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
+async fn listen_on(addr: SocketAddr, relay: &'static TransitRelay) {
     let listener = TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind to {addr}: {e}"));
@@ -278,9 +275,8 @@ async fn listen_on(addr: SocketAddr, relay: Arc<TransitRelay>) {
         // Make the connection as realtime as possible
         stream.set_nodelay(true).expect("Set socket no delay");
 
-        let relay_clone = relay.clone();
         tokio::spawn(async move {
-            if let Err(e) = create_connection(relay_clone, stream, socket).await {
+            if let Err(e) = create_connection(relay, stream, socket).await {
                 error!("Connection error ({socket}): {e}");
             }
         });
