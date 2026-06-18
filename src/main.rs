@@ -62,7 +62,7 @@ impl Peer {
         mut stream: TcpStream,
         socket: SocketAddr,
     ) -> Result<Peer, HandleConnectionError> {
-        let mut buf = Vec::with_capacity(128);
+        let mut buf = [0u8; 128];
         let mut read_buf = ReadBuf::new(&mut buf);
 
         let mut line = timeout(PEER_TIMEOUT, async {
