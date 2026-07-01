@@ -1,6 +1,6 @@
 [package]
 name = "rusty-transit-relay"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [profile.release]
@@ -23,6 +23,7 @@ hex = "0.4.3"
 log = "0.4.25"
 multimap = "0.10.0"
 rust-fsm = "0.7.0"
+sd-notify = "0.5.0"
 thiserror = "2.0.12"
 tokio = { version = "1.43.0", features = ["full"] }
 winnow = "0.7.12"

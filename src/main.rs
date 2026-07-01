@@ -253,6 +253,8 @@ async fn main() -> ! {
         }
     }));
 
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+
     let _ = futures::future::select_all(handles).await;
     unreachable!("critical process exited")
 }
