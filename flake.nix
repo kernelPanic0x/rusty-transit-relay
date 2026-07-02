@@ -34,6 +34,8 @@
             inherit pname version;
             src = self;
 
+            meta.mainProgram = pname;
+
             cargoHash = "sha256-St1nIZabP7JkGYRTh3qE2zgxZRkAiK0jb6ltZZ/BNlQ=";
           };
         }
