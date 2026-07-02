@@ -223,7 +223,7 @@ impl TransitRelay {
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[clap(long, value_parser = parse_socket_addrs, default_values = ["[::]:4001"])]
+    #[clap(long, value_parser = parse_socket_addrs, default_values = ["0.0.0.0:4001", "[::]:4001"])]
     listen: Vec<SocketAddr>,
 }
 
